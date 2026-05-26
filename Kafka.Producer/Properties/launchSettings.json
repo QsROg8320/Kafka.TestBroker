@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Kafka.Producer": {
+      "commandName": "Project",
+      "commandLineArgs": "produce -t test-topic-1 -k key -f 1.txt"
+    }
+  }
+}
