@@ -2420,6 +2420,111 @@ public class BrokerIntegrationTests
         receivedByC1b.Should().Be("msg-A", "grp-1 after ClearGroup must re-read from Earliest");
     }
 
+    // ── Multi-producer / multi-consumer / multi-group cycle with ClearGroup ──
+
+    [Test]
+    [Timeout(120000)]
+    public async Task MultiProducerConsumerChain_CycleWithClearGroup_AllMessagesReceived(CancellationToken cancellationToken)
+    {
+        // All consumers are created AFTER the message is already in the topic (Earliest reset).
+        // Four combinations per round, two groups, two topics:
+        //   (a) P1→topic-A  →  C1/grp-A reads topic-A
+        //   (b) P2→topic-B  →  C2/grp-B reads topic-B
+        //   (c) P1→topic-A  →  C2/grp-B reads topic-A  [group-B switches to topic-A]
+        //   (d) P2→topic-B  →  C1/grp-A reads topic-B  [group-A switches to topic-B]
+        // After each round: ClearGroup(A), ClearGroup(B), ClearAllTopics.
+        // Fresh producer + fresh consumer on every sub-step.
+        await using var broker = await BrokerFixture.CreateAndStartAsync(
+            ("chain-topic-A", 1), ("chain-topic-B", 1));
+
+        static async Task<string?> ConsumeOne(IConsumer<string, string> consumer, CancellationToken ct)
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(8));
+            try
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var r = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                        if (r?.Message?.Value != null) return r.Message.Value;
+                    }
+                    catch (ConsumeException) { }
+                }
+            }
+            catch (OperationCanceledException) { }
+            return null;
+        }
+
+        static async Task Produce(string bootstrapServers, string topic, string key, string value, CancellationToken ct)
+        {
+            using var p = new ProducerBuilder<string, string>(new ProducerConfig
+            {
+                BootstrapServers = bootstrapServers,
+                SecurityProtocol = SecurityProtocol.Plaintext,
+                MessageTimeoutMs = 10000,
+                SocketTimeoutMs = 10000,
+            }).Build();
+            await p.ProduceAsync(topic, new Message<string, string> { Key = key, Value = value }, ct);
+            p.Flush(ct);
+            p.Dispose();
+        }
+
+        const int rounds = 5;
+
+        for (int i = 0; i < rounds; i++)
+        {
+            // (a) P1 → topic-A then C1/grp-A subscribes and reads
+            await Produce(broker.BootstrapServers, "chain-topic-A", $"r{i}a", $"A-grpA-{i}", cancellationToken);
+            using (var c1 = CreateConsumer(broker.BootstrapServers, "chain-grp-A", AutoOffsetReset.Earliest))
+            {
+                c1.Subscribe("chain-topic-A");
+                (await ConsumeOne(c1, cancellationToken))
+                    .Should().NotBeNull($"round {i}(a): C1/grp-A must read topic-A");
+                c1.Close();
+                c1.Dispose();
+            }
+
+            // (b) P2 → topic-B then C2/grp-B subscribes and reads
+            await Produce(broker.BootstrapServers, "chain-topic-B", $"r{i}b", $"B-grpB-{i}", cancellationToken);
+            using (var c2 = CreateConsumer(broker.BootstrapServers, "chain-grp-B", AutoOffsetReset.Earliest))
+            {
+                c2.Subscribe("chain-topic-B");
+                (await ConsumeOne(c2, cancellationToken))
+                    .Should().NotBeNull($"round {i}(b): C2/grp-B must read topic-B");
+                c2.Close();
+                c2.Dispose();
+            }
+
+            // (c) P1 → topic-A then C2/grp-B switches to topic-A and reads
+            await Produce(broker.BootstrapServers, "chain-topic-A", $"r{i}c", $"A-grpB-{i}", cancellationToken);
+            using (var c2 = CreateConsumer(broker.BootstrapServers, "chain-grp-B", AutoOffsetReset.Earliest))
+            {
+                c2.Subscribe("chain-topic-A");
+                (await ConsumeOne(c2, cancellationToken))
+                    .Should().NotBeNull($"round {i}(c): C2/grp-B must read topic-A (cross)");
+                c2.Close();
+                c2.Dispose();
+            }
+
+            // (d) P2 → topic-B then C1/grp-A switches to topic-B and reads
+            await Produce(broker.BootstrapServers, "chain-topic-B", $"r{i}d", $"B-grpA-{i}", cancellationToken);
+            using (var c1 = CreateConsumer(broker.BootstrapServers, "chain-grp-A", AutoOffsetReset.Earliest))
+            {
+                c1.Subscribe("chain-topic-B");
+                (await ConsumeOne(c1, cancellationToken))
+                    .Should().NotBeNull($"round {i}(d): C1/grp-A must read topic-B (cross)");
+                c1.Close();
+                 c1.Dispose();
+            }
+
+            
+            broker.ClearAllTopics();
+            broker.ClearAllGroups();
+        }
+    }
+
     // ── ClearGroup race condition tests ──────────────────────────────────────
 
     [Test]
@@ -2469,5 +2574,159 @@ public class BrokerIntegrationTests
 
         received.Should().ContainSingle().Which.Should().Be("msg",
             "consumer must recover quickly after ClearGroup, not hang for SocketTimeoutMs");
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task ClearTopicAndGroup_ConsumerRejoins_ReceivesNewMessageFromEarliest(CancellationToken cancellationToken)
+    {
+        // ClearTopic resets the offset counter to 0. A consumer stuck at local offset=1 will never
+        // see the new record at OffsetDelta=0. The fix is to also ClearGroup so the Heartbeat
+        // returns REBALANCE_IN_PROGRESS, kicking the consumer out of FetchRequest. It rejoins,
+        // AutoOffsetReset.Earliest kicks in (no committed offset), and it reads from offset 0.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("rejoin-after-clear-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        using var consumer = CreateConsumer(broker.BootstrapServers, "rejoin-after-clear-group", AutoOffsetReset.Earliest);
+        consumer.Subscribe("rejoin-after-clear-topic");
+
+        // Step 1: produce and consume msg-0 → consumer local offset advances to 1
+        await producer.ProduceAsync("rejoin-after-clear-topic",
+            new Message<string, string> { Key = "k0", Value = "msg-0" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        string? first = null;
+        using var cts1 = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try
+        {
+            while (!cts1.IsCancellationRequested && first == null)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value != null) first = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+        first.Should().Be("msg-0");
+
+        // Step 2: clear topic AND group — ClearGroup causes Heartbeat to return REBALANCE_IN_PROGRESS,
+        // kicking the consumer out of its FetchRequest so it can rejoin from offset 0.
+        broker.ClearTopic("rejoin-after-clear-topic");
+        broker.ClearGroup("rejoin-after-clear-group");
+
+        // Step 3: produce msg-1 — lands at OffsetDelta=0 (counter reset by ClearTopic)
+        await producer.ProduceAsync("rejoin-after-clear-topic",
+            new Message<string, string> { Key = "k1", Value = "msg-1" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // Step 4: consumer detects rebalance via next Heartbeat, rejoins, reads from Earliest (offset 0)
+        string? second = null;
+        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        try
+        {
+            while (!cts2.IsCancellationRequested && second == null)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value != null) second = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        second.Should().Be("msg-1",
+            "after ClearTopic+ClearGroup the consumer must rejoin and read msg-1 from Earliest (offset 0)");
+        consumer.Close();
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task ClearGroupDuringSettleWindow_CommitSucceeds_NextConsumerStartsFromCommittedOffset(CancellationToken cancellationToken)
+    {
+        // Bug: old SettleJoinGroup (fired before ClearGroup) finds the NEW session after ClearGroup
+        // and increments its GenerationId. The new SettleJoinGroup increments it again.
+        // Net result: session.GenerationId = consumer's generationId + 1 → OffsetCommit → ILLEGAL_GENERATION.
+        // C2 then starts from Earliest (0) and re-reads msg-0 instead of the expected msg-1.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("commit-settle-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("commit-settle-topic",
+            new Message<string, string> { Key = "k0", Value = "msg-0" }, cancellationToken);
+        await producer.ProduceAsync("commit-settle-topic",
+            new Message<string, string> { Key = "k1", Value = "msg-1" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // C1: manual-commit consumer
+        var c1Config = new ConsumerConfig
+        {
+            BootstrapServers = broker.BootstrapServers,
+            GroupId = "commit-settle-group",
+            AutoOffsetReset = AutoOffsetReset.Earliest,
+            SecurityProtocol = SecurityProtocol.Plaintext,
+            EnableAutoCommit = false,
+            SessionTimeoutMs = 6000,
+            MaxPollIntervalMs = 30000,
+            SocketTimeoutMs = 10000,
+            FetchWaitMaxMs = 500,
+        };
+        using var c1 = new ConsumerBuilder<string, string>(c1Config).Build();
+        c1.Subscribe("commit-settle-topic");
+
+        // Kick JoinGroup into the broker, then ClearGroup inside the 300 ms settle window.
+        try { c1.Consume(TimeSpan.FromMilliseconds(20)); } catch (ConsumeException) { }
+        await Task.Delay(80, cancellationToken);
+        broker.ClearGroup("commit-settle-group");
+
+        // C1 recovers, reads msg-0, commits.
+        ConsumeResult<string, string>? c1Result = null;
+        using var cts1 = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try
+        {
+            while (!cts1.IsCancellationRequested && c1Result == null)
+            {
+                try
+                {
+                    var r = c1.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value != null) c1Result = r;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        c1Result.Should().NotBeNull("C1 must receive msg-0 after recovering from ClearGroup");
+        c1Result!.Message.Value.Should().Be("msg-0");
+        c1.Commit(c1Result);
+        c1.Close();
+
+        // C2 joins the same group — must start from the committed offset (1), not Earliest (0).
+        using var c2 = CreateConsumer(broker.BootstrapServers, "commit-settle-group", AutoOffsetReset.Earliest);
+        c2.Subscribe("commit-settle-topic");
+
+        string? c2Message = null;
+        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try
+        {
+            while (!cts2.IsCancellationRequested && c2Message == null)
+            {
+                try
+                {
+                    var r = c2.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value != null) c2Message = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        c2Message.Should().Be("msg-1",
+            "C2 must start from committed offset (after msg-0), not re-read msg-0 from Earliest — " +
+            "OffsetCommit must not return ILLEGAL_GENERATION due to stale SettleJoinGroup");
+        c2.Close();
     }
 }

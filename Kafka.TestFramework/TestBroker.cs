@@ -260,7 +260,7 @@ namespace Kafka.TestFramework
                     if (!session.SettleScheduled)
                     {
                         session.SettleScheduled = true;
-                        _ = SettleJoinGroup(groupId);
+                        _ = SettleJoinGroup(groupId, session);
                     }
                 }
 
@@ -491,7 +491,7 @@ namespace Kafka.TestFramework
                                 if (_recordsByTopicAndPartition.TryGetValue(topicName, out var topicPartitions) &&
                                     topicPartitions.TryGetValue(idx, out var stored))
                                 {
-                                    lock (stored) { records = stored.Skip((int)offset).ToList(); }
+                                    lock (stored) { records = stored.SkipWhile(r => r.OffsetDelta.Value < offset).ToList(); }
                                 }
                                 _partitionOffsets.TryGetValue((topicName, idx), out var hwm);
                                 return (Index: idx, Offset: offset, Records: records,
@@ -526,7 +526,7 @@ namespace Kafka.TestFramework
                                     if (_recordsByTopicAndPartition.TryGetValue(topicName, out var topicPartitions) &&
                                         topicPartitions.TryGetValue(idx, out var stored))
                                     {
-                                        lock (stored) { records = stored.Skip((int)offset).ToList(); }
+                                        lock (stored) { records = stored.SkipWhile(r => r.OffsetDelta.Value < offset).ToList(); }
                                     }
                                     _partitionOffsets.TryGetValue((topicName, idx), out var hwm);
                                     return (Index: idx, Offset: offset, Records: records,
@@ -699,13 +699,23 @@ namespace Kafka.TestFramework
             });
 
             _testServer.On<HeartbeatRequest, HeartbeatResponse>(request =>
-                request.Respond().WithErrorCode(0));
+            {
+                var groupId = request.GroupId.Value ?? "";
+                var generationId = request.GenerationId.Value;
+
+                // If the session was cleared or generation doesn't match, signal rebalance.
+                // This kicks consumers that are stuck in FetchRequest and missed the ClearGroup.
+                var isStale = !_groupSessions.TryGetValue(groupId, out var session)
+                    || session.GenerationId != generationId;
+
+                return request.Respond().WithErrorCode(isStale ? (short)27 : (short)0);
+            });
 
             _testServer.On<GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse>(request =>
                 request.Respond().WithPushIntervalMs(1000));
         }
 
-        private async Task SettleJoinGroup(string groupId)
+        private async Task SettleJoinGroup(string groupId, GroupSession expectedSession)
         {
             await Task.Delay(300).ConfigureAwait(false);
 
@@ -715,7 +725,9 @@ namespace Kafka.TestFramework
 
             lock (_joinLock)
             {
-                if (!_groupSessions.TryGetValue(groupId, out var session))
+                // Guard against stale settle: if ClearGroup replaced the session with a new object,
+                // bail out. The new session's own SettleJoinGroup will handle it correctly.
+                if (!_groupSessions.TryGetValue(groupId, out var session) || !ReferenceEquals(session, expectedSession))
                     return;
 
                 session.GenerationId++;
