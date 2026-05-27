@@ -232,7 +232,7 @@ public class BrokerIntegrationTests
         using var consumer = CreateConsumer(broker.BootstrapServers, "group-latest", AutoOffsetReset.Latest);
         consumer.Subscribe("latest-topic");
 
-        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
         try
         {
             while (!positioningCts.IsCancellationRequested)
@@ -1529,5 +1529,945 @@ public class BrokerIntegrationTests
             "consumer 2 must start exactly at committed offset 3");
         batch2.Select(r => r.Message.Value).Should().BeEquivalentTo(
             new[] { "msg-3", "msg-4", "msg-5" });
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task Latest_SubscribesAfterClear_ThenProduce_GetsNewMessage(CancellationToken cancellationToken)
+    {
+        // After ClearTopic the HWM resets to 0. A Latest consumer that subscribes
+        // before any new produce lands at offset 0 and should receive the first
+        // message produced after the clear.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("latest-after-clear-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("latest-after-clear-topic",
+            new Message<string, string> { Key = "k0", Value = "old-message" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        broker.ClearTopic("latest-after-clear-topic");
+
+        // Subscribe after clear (HWM=0). Drive protocol loop so JoinGroup/SyncGroup/ListOffsets complete.
+        using var consumer = CreateConsumer(broker.BootstrapServers, "group-latest-after-clear", AutoOffsetReset.Latest);
+        consumer.Subscribe("latest-after-clear-topic");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { while (!positioningCts.IsCancellationRequested) consumer.Consume(TimeSpan.FromMilliseconds(200)); }
+        catch (OperationCanceledException) { }
+
+        await producer.ProduceAsync("latest-after-clear-topic",
+            new Message<string, string> { Key = "k1", Value = "new-message" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        var received = new List<string>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("new-message");
+        received.Should().NotContain("old-message", "old-message was removed by ClearTopic");
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task Latest_SubscribesAfterClearAndProduce_MissesExistingMessage_GetsSubsequentMessage(CancellationToken cancellationToken)
+    {
+        // Clear + produce "after-clear" (HWM=1). A Late Latest subscriber positions at
+        // HWM=1 and must NOT see "after-clear". It should receive only the next produce.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("latest-late-subscribe-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("latest-late-subscribe-topic",
+            new Message<string, string> { Key = "k0", Value = "pre-clear" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        broker.ClearTopic("latest-late-subscribe-topic");
+
+        await producer.ProduceAsync("latest-late-subscribe-topic",
+            new Message<string, string> { Key = "k1", Value = "after-clear" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // Subscribe with Latest at HWM=1 — misses "after-clear"
+        using var consumer = CreateConsumer(broker.BootstrapServers, "group-latest-late-sub", AutoOffsetReset.Latest);
+        consumer.Subscribe("latest-late-subscribe-topic");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { while (!positioningCts.IsCancellationRequested) consumer.Consume(TimeSpan.FromMilliseconds(200)); }
+        catch (OperationCanceledException) { }
+
+        await producer.ProduceAsync("latest-late-subscribe-topic",
+            new Message<string, string> { Key = "k2", Value = "newest" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        var received = new List<string>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("newest");
+        received.Should().NotContain("after-clear");
+        received.Should().NotContain("pre-clear");
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task Earliest_AfterMultipleClears_AlwaysStartsFromOffset0(CancellationToken cancellationToken)
+    {
+        // Each ClearTopic resets the HWM to 0. After N clear cycles Earliest must see
+        // only the messages produced after the last clear, starting at offset 0.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("multi-clear-earliest-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(20));
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+
+        await producer.ProduceAsync("multi-clear-earliest-topic",
+            new Message<string, string> { Key = "k1", Value = "round1" }, cts.Token);
+        producer.Flush(cts.Token);
+        broker.ClearTopic("multi-clear-earliest-topic");
+
+        await producer.ProduceAsync("multi-clear-earliest-topic",
+            new Message<string, string> { Key = "k2", Value = "round2" }, cts.Token);
+        producer.Flush(cts.Token);
+        broker.ClearTopic("multi-clear-earliest-topic");
+
+        await producer.ProduceAsync("multi-clear-earliest-topic",
+            new Message<string, string> { Key = "k3", Value = "final" }, cts.Token);
+        producer.Flush(cts.Token);
+
+        using var consumer = CreateConsumer(broker.BootstrapServers, "group-multi-clear-earliest", AutoOffsetReset.Earliest);
+        consumer.Subscribe("multi-clear-earliest-topic");
+
+        var received = new List<ConsumeResult<string, string>>();
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            while (!drainCts.IsCancellationRequested)
+            {
+                var r = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) received.Add(r);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle("only the post-last-clear message survives");
+        received[0].Message.Value.Should().Be("final");
+        received[0].TopicPartitionOffset.Offset.Value.Should().Be(0, "HWM resets to 0 after each ClearTopic");
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task Latest_AfterMultipleClears_PositionsAtCurrentHWM(CancellationToken cancellationToken)
+    {
+        // After repeated clear+produce cycles the surviving HWM is 1 (one message since last clear).
+        // A Latest subscriber must position at that HWM and miss all pre-subscription messages.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("multi-clear-latest-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+
+        await producer.ProduceAsync("multi-clear-latest-topic",
+            new Message<string, string> { Key = "k1", Value = "round1" }, cancellationToken);
+        producer.Flush(cancellationToken);
+        broker.ClearTopic("multi-clear-latest-topic");
+
+        await producer.ProduceAsync("multi-clear-latest-topic",
+            new Message<string, string> { Key = "k2", Value = "round2" }, cancellationToken);
+        producer.Flush(cancellationToken);
+        broker.ClearTopic("multi-clear-latest-topic");
+
+        // After last clear: HWM=0. Produce one more message → HWM=1.
+        await producer.ProduceAsync("multi-clear-latest-topic",
+            new Message<string, string> { Key = "k3", Value = "after-last-clear" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // Latest subscriber positions at HWM=1 — misses "after-last-clear"
+        using var consumer = CreateConsumer(broker.BootstrapServers, "group-multi-clear-latest", AutoOffsetReset.Latest);
+        consumer.Subscribe("multi-clear-latest-topic");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { while (!positioningCts.IsCancellationRequested) consumer.Consume(TimeSpan.FromMilliseconds(200)); }
+        catch (OperationCanceledException) { }
+
+        await producer.ProduceAsync("multi-clear-latest-topic",
+            new Message<string, string> { Key = "k4", Value = "new-message" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        var received = new List<string>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("new-message");
+        received.Should().NotContain("after-last-clear", "Latest positioned past it at subscription time");
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task ClearThenProduce_EarliestGetsAllMessages_LatestPositionsAtHWM(CancellationToken cancellationToken)
+    {
+        // Same topic, two groups, different auto.offset.reset.
+        // Earliest reads all messages produced after clear; Latest sees nothing
+        // until a new message arrives after it has subscribed.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("offset-reset-comparison-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(45));
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("offset-reset-comparison-topic",
+            new Message<string, string> { Key = "k0", Value = "before-clear" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        broker.ClearTopic("offset-reset-comparison-topic");
+
+        await producer.ProduceAsync("offset-reset-comparison-topic",
+            new Message<string, string> { Key = "k1", Value = "msg-1" }, cancellationToken);
+        await producer.ProduceAsync("offset-reset-comparison-topic",
+            new Message<string, string> { Key = "k2", Value = "msg-2" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // Latest consumer subscribes at HWM=2
+        using var latestConsumer = CreateConsumer(broker.BootstrapServers, "group-latest-compare", AutoOffsetReset.Latest);
+        latestConsumer.Subscribe("offset-reset-comparison-topic");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { while (!positioningCts.IsCancellationRequested) latestConsumer.Consume(TimeSpan.FromMilliseconds(200)); }
+        catch (OperationCanceledException) { }
+
+        // Earliest consumer reads both post-clear messages
+        using var earliestConsumer = CreateConsumer(broker.BootstrapServers, "group-earliest-compare", AutoOffsetReset.Earliest);
+        earliestConsumer.Subscribe("offset-reset-comparison-topic");
+
+        var earliestReceived = new List<string>();
+        try
+        {
+            while (!cts.IsCancellationRequested && earliestReceived.Count < 2)
+            {
+                var r = earliestConsumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) earliestReceived.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        earliestReceived.Should().BeEquivalentTo(new[] { "msg-1", "msg-2" });
+        earliestReceived.Should().NotContain("before-clear", "ClearTopic removed it");
+
+        // Latest should have received nothing so far
+        var latestReceived = new List<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            while (!drainCts.IsCancellationRequested)
+            {
+                var r = latestConsumer.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) latestReceived.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        latestReceived.Should().BeEmpty("Latest positioned at HWM sees no pre-subscription messages");
+
+        // Produce one more — Latest must now receive it
+        await producer.ProduceAsync("offset-reset-comparison-topic",
+            new Message<string, string> { Key = "k3", Value = "msg-3" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        try
+        {
+            while (!cts.IsCancellationRequested && latestReceived.Count < 1)
+            {
+                var r = latestConsumer.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) latestReceived.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        latestReceived.Should().ContainSingle().Which.Should().Be("msg-3");
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task ClearAllTopics_Latest_ConsumerGetsOnlySubsequentMessages(CancellationToken cancellationToken)
+    {
+        // ClearAllTopics resets HWM to 0 on every topic. Latest consumers that subscribe
+        // after the clear and before new produces must receive only the new messages.
+        await using var broker = await BrokerFixture.CreateAndStartAsync(
+            ("clear-all-latest-a", 1),
+            ("clear-all-latest-b", 1));
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+
+        await producer.ProduceAsync("clear-all-latest-a",
+            new Message<string, string> { Key = "k1", Value = "old-a" }, cancellationToken);
+        await producer.ProduceAsync("clear-all-latest-b",
+            new Message<string, string> { Key = "k2", Value = "old-b" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        broker.ClearAllTopics();
+
+        // Both Latest consumers subscribe with HWM=0 on both topics
+        using var consumerA = CreateConsumer(broker.BootstrapServers, "group-latest-all-a", AutoOffsetReset.Latest);
+        using var consumerB = CreateConsumer(broker.BootstrapServers, "group-latest-all-b", AutoOffsetReset.Latest);
+        consumerA.Subscribe("clear-all-latest-a");
+        consumerB.Subscribe("clear-all-latest-b");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var posA = Task.Run(() =>
+        {
+            try { while (!positioningCts.IsCancellationRequested) consumerA.Consume(TimeSpan.FromMilliseconds(200)); }
+            catch (OperationCanceledException) { }
+        });
+        var posB = Task.Run(() =>
+        {
+            try { while (!positioningCts.IsCancellationRequested) consumerB.Consume(TimeSpan.FromMilliseconds(200)); }
+            catch (OperationCanceledException) { }
+        });
+        await Task.WhenAll(posA, posB);
+
+        await producer.ProduceAsync("clear-all-latest-a",
+            new Message<string, string> { Key = "k3", Value = "new-a" }, cancellationToken);
+        await producer.ProduceAsync("clear-all-latest-b",
+            new Message<string, string> { Key = "k4", Value = "new-b" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var receivedA = new List<string>();
+        var receivedB = new List<string>();
+
+        try
+        {
+            while (!cts.IsCancellationRequested && receivedA.Count < 1)
+            {
+                var r = consumerA.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) receivedA.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        try
+        {
+            while (!cts.IsCancellationRequested && receivedB.Count < 1)
+            {
+                var r = consumerB.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) receivedB.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        receivedA.Should().ContainSingle().Which.Should().Be("new-a");
+        receivedB.Should().ContainSingle().Which.Should().Be("new-b");
+    }
+
+    [Test]
+    [Timeout(60000)]
+    public async Task ClearGroup_Latest_NewConsumerPositionsAtHWM_NotAtBeginning(CancellationToken cancellationToken)
+    {
+        // ClearGroup wipes committed offsets. A replacement Latest consumer uses
+        // ListOffsets(Latest) = HWM and does NOT re-read old messages —
+        // unlike Earliest which would reset to offset 0 (tested in ClearGroup_Alone test).
+        await using var broker = await BrokerFixture.CreateAndStartAsync("clear-group-latest-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(45));
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("clear-group-latest-topic",
+            new Message<string, string> { Key = "k1", Value = "existing-1" }, cts.Token);
+        await producer.ProduceAsync("clear-group-latest-topic",
+            new Message<string, string> { Key = "k2", Value = "existing-2" }, cts.Token);
+        producer.Flush(cts.Token);
+
+        // Consumer1: read and commit both messages, then close cleanly
+        using var consumer1 = CreateConsumer(broker.BootstrapServers, "group-cg-latest", AutoOffsetReset.Earliest);
+        consumer1.Subscribe("clear-group-latest-topic");
+
+        var round1 = new List<ConsumeResult<string, string>>();
+        try
+        {
+            while (!cts.IsCancellationRequested && round1.Count < 2)
+            {
+                var r = consumer1.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) { round1.Add(r); consumer1.Commit(r); }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        round1.Should().HaveCount(2);
+        consumer1.Close();
+
+        // Reset group state — committed offsets gone, group session cleared
+        broker.ClearGroup("group-cg-latest");
+
+        // Consumer2 with Latest: no committed offset → auto.offset.reset=Latest → HWM=2
+        // Must NOT re-read existing-1 or existing-2
+        using var consumer2 = CreateConsumer(broker.BootstrapServers, "group-cg-latest", AutoOffsetReset.Latest);
+        consumer2.Subscribe("clear-group-latest-topic");
+
+        using var positioningCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try { while (!positioningCts.IsCancellationRequested) consumer2.Consume(TimeSpan.FromMilliseconds(200)); }
+        catch (OperationCanceledException) { }
+
+        var receivedOld = new List<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            while (!drainCts.IsCancellationRequested)
+            {
+                var r = consumer2.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) receivedOld.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        receivedOld.Should().BeEmpty("Latest after ClearGroup positions at HWM, not at offset 0");
+
+        // Produce a new message — consumer2 must receive it
+        await producer.ProduceAsync("clear-group-latest-topic",
+            new Message<string, string> { Key = "k3", Value = "new-message" }, cts.Token);
+        producer.Flush(cts.Token);
+
+        var receivedNew = new List<string>();
+        try
+        {
+            while (!cts.IsCancellationRequested && receivedNew.Count < 1)
+            {
+                var r = consumer2.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) receivedNew.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        receivedNew.Should().ContainSingle().Which.Should().Be("new-message");
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task AfterClearGroupAndTopic_NewProducer_NewEarliestConsumer_ReceivesMessages(CancellationToken cancellationToken)
+    {
+        await using var broker = await BrokerFixture.CreateAndStartAsync("reset-full-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(20));
+
+        // Phase 1: produce and consume
+        using var producer1 = CreateProducer(broker.BootstrapServers);
+        await producer1.ProduceAsync("reset-full-topic",
+            new Message<string, string> { Key = "k1", Value = "before-clear" }, cts.Token);
+        producer1.Flush(cts.Token);
+
+        using var consumer1 = CreateConsumer(broker.BootstrapServers, "reset-full-group", AutoOffsetReset.Earliest);
+        consumer1.Subscribe("reset-full-topic");
+
+        ConsumeResult<string, string>? first = null;
+        try
+        {
+            while (!cts.IsCancellationRequested && first == null)
+            {
+                var r = consumer1.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) { first = r; consumer1.Commit(r); }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        first.Should().NotBeNull();
+        consumer1.Close();
+
+        // Phase 2: clear group and topic
+        broker.ClearGroup("reset-full-group");
+        broker.ClearTopic("reset-full-topic");
+
+        // Phase 3: new producer sends a message
+        using var producer2 = CreateProducer(broker.BootstrapServers);
+        await producer2.ProduceAsync("reset-full-topic",
+            new Message<string, string> { Key = "k2", Value = "after-clear" }, cts.Token);
+        producer2.Flush(cts.Token);
+
+        // Phase 4: new Earliest consumer in same group — must receive "after-clear"
+        using var consumer2 = CreateConsumer(broker.BootstrapServers, "reset-full-group", AutoOffsetReset.Earliest);
+        consumer2.Subscribe("reset-full-topic");
+
+        var received = new List<string>();
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer2.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("after-clear");
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task AfterClearGroupAndTopic_ActiveConsumer1NotClosed_NewEarliestConsumer_ReceivesMessages(CancellationToken cancellationToken)
+    {
+        // Reproduces the bug: consumer1 is still actively polling (not closed) when
+        // ClearGroup+ClearTopic is called. Consumer1 and consumer2 both end up in the
+        // same SettleJoinGroup window. With 1 partition and 2 consumers the leader
+        // assigns the partition to one of them — consumer2 gets nothing if consumer1
+        // wins the assignment.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("live-consumer-clear-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(20));
+
+        using var producer1 = CreateProducer(broker.BootstrapServers);
+        await producer1.ProduceAsync("live-consumer-clear-topic",
+            new Message<string, string> { Key = "k1", Value = "before-clear" }, cts.Token);
+        producer1.Flush(cts.Token);
+
+        // consumer1 polls in the background and is intentionally NOT closed before the clear
+        var consumer1 = CreateConsumer(broker.BootstrapServers, "live-group", AutoOffsetReset.Earliest);
+        consumer1.Subscribe("live-consumer-clear-topic");
+
+        using var consumer1Cts = new CancellationTokenSource();
+        var consumer1Read = new TaskCompletionSource<bool>();
+        var consumer1Task = Task.Run(() =>
+        {
+            try
+            {
+                while (!consumer1Cts.IsCancellationRequested)
+                {
+                    var r = consumer1.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value == "before-clear")
+                        consumer1Read.TrySetResult(true);
+                }
+            }
+            catch (OperationCanceledException) { }
+        }, cancellationToken);
+
+        // Wait until consumer1 has actually read the message
+        await consumer1Read.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+
+        // Clear WITHOUT closing consumer1 — it is still actively polling
+        broker.ClearGroup("live-group");
+        broker.ClearTopic("live-consumer-clear-topic");
+
+        using var producer2 = CreateProducer(broker.BootstrapServers);
+        await producer2.ProduceAsync("live-consumer-clear-topic",
+            new Message<string, string> { Key = "k2", Value = "after-clear" }, cts.Token);
+        producer2.Flush(cts.Token);
+
+        using var consumer2 = CreateConsumer(broker.BootstrapServers, "live-group", AutoOffsetReset.Earliest);
+        consumer2.Subscribe("live-consumer-clear-topic");
+
+        var received = new List<string>();
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                var r = consumer2.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        consumer1Cts.Cancel();
+        await consumer1Task;
+        consumer1.Close();
+        consumer1.Dispose();
+
+        received.Should().ContainSingle().Which.Should().Be("after-clear");
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task StaleCommitAfterClearGroup_PoisonsOffset_NewEarliestConsumerMissesMessage(CancellationToken cancellationToken)
+    {
+        // The bug: consumer1 reads a message but delays the Commit() call.
+        // ClearGroup+ClearTopic runs and wipes state. Then consumer1.Commit() fires —
+        // the stale committed offset (1) is written back into the now-clean broker.
+        // consumer2 (Earliest, same group) sees committed=1, fetches from offset 1,
+        // and misses "after-clear" which sits at offset 0.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("stale-commit-topic");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(20));
+
+        using var producer1 = CreateProducer(broker.BootstrapServers);
+        await producer1.ProduceAsync("stale-commit-topic",
+            new Message<string, string> { Key = "k1", Value = "before-clear" }, cts.Token);
+        producer1.Flush(cts.Token);
+
+        using var consumer1 = CreateConsumer(broker.BootstrapServers, "stale-group", AutoOffsetReset.Earliest);
+        consumer1.Subscribe("stale-commit-topic");
+
+        ConsumeResult<string, string>? result = null;
+        try
+        {
+            while (!cts.IsCancellationRequested && result == null)
+            {
+                var r = consumer1.Consume(TimeSpan.FromMilliseconds(500));
+                if (r?.Message?.Value != null) result = r;
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        result.Should().NotBeNull();
+
+        // Clear BEFORE consumer1 commits — simulates race with delayed auto-commit
+        broker.ClearGroup("stale-group");
+        broker.ClearTopic("stale-commit-topic");
+
+        // Stale commit arrives AFTER the clear — broker rejects it with ILLEGAL_GENERATION
+        try { consumer1.Commit(result!); } catch (KafkaException) { /* expected — broker rejected stale commit */ }
+        consumer1.Close();
+
+        // New message at offset 0 after clear
+        using var producer2 = CreateProducer(broker.BootstrapServers);
+        await producer2.ProduceAsync("stale-commit-topic",
+            new Message<string, string> { Key = "k2", Value = "after-clear" }, cts.Token);
+        producer2.Flush(cts.Token);
+
+        // consumer2 Earliest: but committed offset is now 1 (from stale commit) → misses offset 0
+        using var consumer2 = CreateConsumer(broker.BootstrapServers, "stale-group", AutoOffsetReset.Earliest);
+        consumer2.Subscribe("stale-commit-topic");
+
+        var received = new List<string>();
+        using var shortCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (!shortCts.IsCancellationRequested)
+            {
+                var r = consumer2.Consume(TimeSpan.FromMilliseconds(300));
+                if (r?.Message?.Value != null) received.Add(r.Message.Value);
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("after-clear",
+            "stale commit must not poison the committed offset after ClearGroup");
+    }
+
+    // ── Multiple consumers / multiple producers tests ────────────────────────
+
+    [Test]
+    public async Task MultipleConsumers_SameGroup_ReceiveAllMessages_WithoutDuplicates()
+    {
+        // Two consumers in the same group share the partition (or both subscribe — in a
+        // single-partition topic only one will own it, but they together must see all msgs).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync("mc-topic", 1, "mc-group");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        var messages = new[] { "msg-1", "msg-2", "msg-3", "msg-4", "msg-5" };
+        foreach (var m in messages)
+            await producer.ProduceAsync("mc-topic", new Message<string, string> { Key = "k", Value = m }, cts.Token);
+        producer.Flush(cts.Token);
+
+        using var c1 = CreateConsumer(broker.BootstrapServers, "mc-group", AutoOffsetReset.Earliest);
+        using var c2 = CreateConsumer(broker.BootstrapServers, "mc-group", AutoOffsetReset.Earliest);
+        c1.Subscribe("mc-topic");
+        c2.Subscribe("mc-topic");
+
+        var received = new ConcurrentBag<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!drainCts.IsCancellationRequested && received.Count < messages.Length)
+        {
+            var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
+            if (r1?.Message?.Value != null) received.Add(r1.Message.Value);
+            var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
+            if (r2?.Message?.Value != null) received.Add(r2.Message.Value);
+        }
+
+        received.Should().BeEquivalentTo(messages, "all messages must be consumed exactly once across the group");
+    }
+
+    [Test]
+    public async Task MultipleConsumers_DifferentGroups_EachReceiveAllMessages()
+    {
+        // Two independent groups — each must receive the full set of messages.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync(
+            ("multi-group-topic", 1));
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        var messages = new[] { "a", "b", "c" };
+        foreach (var m in messages)
+            await producer.ProduceAsync("multi-group-topic", new Message<string, string> { Key = "k", Value = m }, cts.Token);
+        producer.Flush(cts.Token);
+
+        using var cA = CreateConsumer(broker.BootstrapServers, "group-A", AutoOffsetReset.Earliest);
+        using var cB = CreateConsumer(broker.BootstrapServers, "group-B", AutoOffsetReset.Earliest);
+        cA.Subscribe("multi-group-topic");
+        cB.Subscribe("multi-group-topic");
+
+        var receivedA = new List<string>();
+        var receivedB = new List<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!drainCts.IsCancellationRequested &&
+               (receivedA.Count < messages.Length || receivedB.Count < messages.Length))
+        {
+            if (receivedA.Count < messages.Length)
+            {
+                var r = cA.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) receivedA.Add(r.Message.Value);
+            }
+            if (receivedB.Count < messages.Length)
+            {
+                var r = cB.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) receivedB.Add(r.Message.Value);
+            }
+        }
+
+        receivedA.Should().BeEquivalentTo(messages, "group-A must see all messages independently");
+        receivedB.Should().BeEquivalentTo(messages, "group-B must see all messages independently");
+    }
+
+    [Test]
+    public async Task MultipleProducers_SameGroup_ConsumerReceivesAll()
+    {
+        // Multiple producers write to the same topic — a single consumer must see all of them.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync("mp-topic", 1, "mp-group");
+
+        using var p1 = CreateProducer(broker.BootstrapServers);
+        using var p2 = CreateProducer(broker.BootstrapServers);
+
+        await p1.ProduceAsync("mp-topic", new Message<string, string> { Key = "k", Value = "from-p1-1" }, cts.Token);
+        await p2.ProduceAsync("mp-topic", new Message<string, string> { Key = "k", Value = "from-p2-1" }, cts.Token);
+        await p1.ProduceAsync("mp-topic", new Message<string, string> { Key = "k", Value = "from-p1-2" }, cts.Token);
+        await p2.ProduceAsync("mp-topic", new Message<string, string> { Key = "k", Value = "from-p2-2" }, cts.Token);
+        p1.Flush(cts.Token);
+        p2.Flush(cts.Token);
+
+        using var consumer = CreateConsumer(broker.BootstrapServers, "mp-group", AutoOffsetReset.Earliest);
+        consumer.Subscribe("mp-topic");
+
+        var received = new List<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!drainCts.IsCancellationRequested && received.Count < 4)
+        {
+            var r = consumer.Consume(TimeSpan.FromMilliseconds(300));
+            if (r?.Message?.Value != null) received.Add(r.Message.Value);
+        }
+
+        received.Should().HaveCount(4);
+        received.Should().Contain("from-p1-1").And.Contain("from-p1-2")
+                .And.Contain("from-p2-1").And.Contain("from-p2-2");
+    }
+
+    [Test]
+    public async Task MultipleProducers_TwoGroups_BothGroupsReceiveAllProducerMessages()
+    {
+        // Two producers, two independent consumer groups — each group sees all produced messages.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync("mp2g-topic", 1, "gX");
+
+        using var p1 = CreateProducer(broker.BootstrapServers);
+        using var p2 = CreateProducer(broker.BootstrapServers);
+
+        await p1.ProduceAsync("mp2g-topic", new Message<string, string> { Key = "k", Value = "p1-msg" }, cts.Token);
+        await p2.ProduceAsync("mp2g-topic", new Message<string, string> { Key = "k", Value = "p2-msg" }, cts.Token);
+        p1.Flush(cts.Token);
+        p2.Flush(cts.Token);
+
+        using var cX = CreateConsumer(broker.BootstrapServers, "gX", AutoOffsetReset.Earliest);
+        using var cY = CreateConsumer(broker.BootstrapServers, "gY", AutoOffsetReset.Earliest);
+        cX.Subscribe("mp2g-topic");
+        cY.Subscribe("mp2g-topic");
+
+        var rxX = new List<string>();
+        var rxY = new List<string>();
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!drainCts.IsCancellationRequested && (rxX.Count < 2 || rxY.Count < 2))
+        {
+            if (rxX.Count < 2) { var r = cX.Consume(TimeSpan.FromMilliseconds(200)); if (r?.Message?.Value != null) rxX.Add(r.Message.Value); }
+            if (rxY.Count < 2) { var r = cY.Consume(TimeSpan.FromMilliseconds(200)); if (r?.Message?.Value != null) rxY.Add(r.Message.Value); }
+        }
+
+        rxX.Should().BeEquivalentTo(new[] { "p1-msg", "p2-msg" }, "gX must see both producers' messages");
+        rxY.Should().BeEquivalentTo(new[] { "p1-msg", "p2-msg" }, "gY must see both producers' messages");
+    }
+
+    [Test]
+    public async Task MultipleConsumers_SameGroup_AfterClearAndReproduce_AllReceiveNewMessages()
+    {
+        // After ClearGroup+ClearTopic, two consumers in the same group should together
+        // read the newly produced messages from offset 0 (Earliest).
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync("mc-clear-topic", 1, "mc-clear-group");
+
+        using var p1 = CreateProducer(broker.BootstrapServers);
+        await p1.ProduceAsync("mc-clear-topic", new Message<string, string> { Key = "k", Value = "old-msg" }, cts.Token);
+        p1.Flush(cts.Token);
+
+        // Consume and commit with consumer in the group
+        using var oldConsumer = CreateConsumer(broker.BootstrapServers, "mc-clear-group", AutoOffsetReset.Earliest);
+        oldConsumer.Subscribe("mc-clear-topic");
+        using (var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+        {
+            while (!drainCts.IsCancellationRequested)
+            {
+                var r = oldConsumer.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) { oldConsumer.Commit(r); break; }
+            }
+        }
+        oldConsumer.Close();
+
+        broker.ClearGroup("mc-clear-group");
+        broker.ClearTopic("mc-clear-topic");
+
+        using var p2 = CreateProducer(broker.BootstrapServers);
+        await p2.ProduceAsync("mc-clear-topic", new Message<string, string> { Key = "k", Value = "new-1" }, cts.Token);
+        await p2.ProduceAsync("mc-clear-topic", new Message<string, string> { Key = "k", Value = "new-2" }, cts.Token);
+        p2.Flush(cts.Token);
+
+        using var c1 = CreateConsumer(broker.BootstrapServers, "mc-clear-group", AutoOffsetReset.Earliest);
+        using var c2 = CreateConsumer(broker.BootstrapServers, "mc-clear-group", AutoOffsetReset.Earliest);
+        c1.Subscribe("mc-clear-topic");
+        c2.Subscribe("mc-clear-topic");
+
+        var received = new ConcurrentBag<string>();
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (!readCts.IsCancellationRequested && received.Count < 2)
+        {
+            var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
+            if (r1?.Message?.Value != null) received.Add(r1.Message.Value);
+            var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
+            if (r2?.Message?.Value != null) received.Add(r2.Message.Value);
+        }
+
+        received.Should().BeEquivalentTo(new[] { "new-1", "new-2" },
+            "after clear, Earliest consumers must start from offset 0 and receive all new messages");
+    }
+
+    [Test]
+    public async Task MultipleProducers_DifferentGroups_IndependentOffsets_AfterClear()
+    {
+        // Two groups track offsets independently; clearing one group doesn't affect the other.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await using var broker = await BrokerFixture.CreateAndStartAsync("indep-topic", 1, "grp-1");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("indep-topic", new Message<string, string> { Key = "k", Value = "msg-A" }, cts.Token);
+        producer.Flush(cts.Token);
+
+        // grp-1 reads and commits
+        using var c1 = CreateConsumer(broker.BootstrapServers, "grp-1", AutoOffsetReset.Earliest);
+        c1.Subscribe("indep-topic");
+        using (var d = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+        {
+            while (!d.IsCancellationRequested)
+            {
+                var r = c1.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) { c1.Commit(r); break; }
+            }
+        }
+        c1.Close();
+
+        // grp-2 has NOT consumed yet
+        // Now clear only grp-1 — grp-2 should still start from Earliest (offset 0)
+        broker.ClearGroup("grp-1");
+
+        using var c2 = CreateConsumer(broker.BootstrapServers, "grp-2", AutoOffsetReset.Earliest);
+        c2.Subscribe("indep-topic");
+        string? receivedByC2 = null;
+        using (var d = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+        {
+            while (!d.IsCancellationRequested && receivedByC2 == null)
+            {
+                var r = c2.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) receivedByC2 = r.Message.Value;
+            }
+        }
+        c2.Close();
+
+        receivedByC2.Should().Be("msg-A", "clearing grp-1 must not affect grp-2's offset tracking");
+
+        // grp-1 after its own clear should also see the message again (Earliest from offset 0)
+        using var c1b = CreateConsumer(broker.BootstrapServers, "grp-1", AutoOffsetReset.Earliest);
+        c1b.Subscribe("indep-topic");
+        string? receivedByC1b = null;
+        using (var d = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+        {
+            while (!d.IsCancellationRequested && receivedByC1b == null)
+            {
+                var r = c1b.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) receivedByC1b = r.Message.Value;
+            }
+        }
+
+        receivedByC1b.Should().Be("msg-A", "grp-1 after ClearGroup must re-read from Earliest");
+    }
+
+    // ── ClearGroup race condition tests ──────────────────────────────────────
+
+    [Test]
+    [Timeout(5000)] // without fix: consumer waits ~SocketTimeoutMs (10 s) before recovering → test times out
+    public async Task ClearGroup_DuringJoinGroupSettleWindow_ConsumerReceivesMessageWithoutHanging(CancellationToken cancellationToken)
+    {
+        // SettleJoinGroup fires 300 ms after JoinGroup is registered on the broker.
+        // ClearGroup called in that window removes the session without canceling the
+        // pending TCS — SettleJoinGroup wakes up, finds no session, returns silently,
+        // and the consumer blocks until SocketTimeoutMs (~10 s) causes a reconnect.
+        // With fix: TCS.TrySetCanceled() fires immediately → consumer retries in ~400 ms.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("join-hang-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("join-hang-topic",
+            new Message<string, string> { Key = "k", Value = "msg" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        using var consumer = CreateConsumer(broker.BootstrapServers, "join-hang-group", AutoOffsetReset.Earliest);
+        consumer.Subscribe("join-hang-topic");
+
+        // Drive the protocol loop so JoinGroup is sent and registered on the broker.
+        try { consumer.Consume(TimeSpan.FromMilliseconds(20)); } catch (ConsumeException) { }
+        // Wait long enough for JoinGroup to arrive (<<300 ms settle window).
+        await Task.Delay(80, cancellationToken);
+
+        // Clear inside the settle window — orphans the pending TCS (bug trigger).
+        broker.ClearGroup("join-hang-group");
+
+        // With fix: consumer gets REBALANCE_IN_PROGRESS instantly, rejoins in ~400 ms, receives message.
+        // Without fix: consumer waits ~SocketTimeoutMs (10 s) → test times out at 5 s.
+        var received = new List<string>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+        try
+        {
+            while (!cts.IsCancellationRequested && received.Count < 1)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(100));
+                    if (r?.Message?.Value != null) received.Add(r.Message.Value);
+                }
+                catch (ConsumeException) { /* REBALANCE_IN_PROGRESS surfaced — consumer is retrying */ }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().ContainSingle().Which.Should().Be("msg",
+            "consumer must recover quickly after ClearGroup, not hang for SocketTimeoutMs");
     }
 }

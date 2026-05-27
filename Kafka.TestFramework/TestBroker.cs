@@ -47,6 +47,7 @@ namespace Kafka.TestFramework
         private readonly ConcurrentDictionary<(string Topic, int Partition), long> _partitionOffsets = new();
         private readonly ConcurrentDictionary<(string Group, string Topic, int Partition), long> _committedOffsets = new();
         private readonly ConcurrentDictionary<(string Topic, int Partition), short> _partitionErrors = new();
+        private readonly ConcurrentDictionary<string, int> _groupLastGenerationId = new();
         private long _nextProducerId = 0;
         private IAsyncDisposable? _runningServer;
 
@@ -118,10 +119,22 @@ namespace Kafka.TestFramework
 
         public void ClearGroup(string groupId)
         {
-            _groupSessions.TryRemove(groupId, out _);
+            lock (_joinLock)
+            {
+                if (_groupSessions.TryGetValue(groupId, out var clearedSession))
+                {
+                    _groupLastGenerationId[groupId] = clearedSession.GenerationId + 1;
+                    foreach (var (_, tcs) in clearedSession.PendingJoins.Values)
+                        tcs.TrySetCanceled();
+                }
+                _groupSessions.TryRemove(groupId, out _);
+            }
 
             foreach (var key in _syncSessions.Keys.Where(k => k.GroupId == groupId).ToList())
-                _syncSessions.TryRemove(key, out _);
+            {
+                if (_syncSessions.TryRemove(key, out var syncSession))
+                    syncSession.AssignmentsTcs.TrySetCanceled();
+            }
 
             foreach (var key in _committedOffsets.Keys.Where(k => k.Group == groupId).ToList())
                 _committedOffsets.TryRemove(key, out _);
@@ -229,7 +242,10 @@ namespace Kafka.TestFramework
 
                 lock (_joinLock)
                 {
-                    var session = _groupSessions.GetOrAdd(groupId, _ => new GroupSession());
+                    var session = _groupSessions.GetOrAdd(groupId, _ => new GroupSession
+                    {
+                        GenerationId = _groupLastGenerationId.TryGetValue(groupId, out var lastGen) ? lastGen : 0
+                    });
 
                     tcs = new TaskCompletionSource<GroupSession.JoinResult>(
                         TaskCreationOptions.RunContinuationsAsynchronously);
@@ -489,7 +505,40 @@ namespace Kafka.TestFramework
                     .ToList();
 
                 if (!topicData.Any() && request.MaxWaitMs.Value > 0)
+                {
                     await Task.Delay(request.MaxWaitMs.Value, cancellationToken).ConfigureAwait(false);
+                    // Re-check after the long-poll wait — records may have arrived during the delay.
+                    topicData = request.TopicsCollection
+                        .Select(topicRequest =>
+                        {
+                            var topicName = topicRequest.Topic;
+                            var partitions = topicRequest.PartitionsCollection
+                                .Select(p =>
+                                {
+                                    var idx = p.Partition.Value;
+                                    var offset = p.FetchOffset.Value;
+
+                                    if (_partitionErrors.TryGetValue((topicName, idx), out var errCode))
+                                        return (Index: idx, Offset: offset, Records: new List<Record>(),
+                                                HighWatermark: 0L, ErrorCode: errCode);
+
+                                    List<Record> records = new();
+                                    if (_recordsByTopicAndPartition.TryGetValue(topicName, out var topicPartitions) &&
+                                        topicPartitions.TryGetValue(idx, out var stored))
+                                    {
+                                        lock (stored) { records = stored.Skip((int)offset).ToList(); }
+                                    }
+                                    _partitionOffsets.TryGetValue((topicName, idx), out var hwm);
+                                    return (Index: idx, Offset: offset, Records: records,
+                                            HighWatermark: hwm, ErrorCode: (short)0);
+                                })
+                                .Where(p => p.Records.Any() || p.ErrorCode != 0)
+                                .ToList();
+                            return (TopicName: topicName, Partitions: partitions);
+                        })
+                        .Where(t => t.Partitions.Any())
+                        .ToList();
+                }
 
                 var topicConfigurators = topicData.Select(t =>
                     new Func<FetchResponse.FetchableTopicResponse, FetchResponse.FetchableTopicResponse>(
@@ -558,7 +607,7 @@ namespace Kafka.TestFramework
                                                     .WithLogAppendTimeMs(-1);
 
                                             var records = topicPartitions.GetOrAdd(partitionIndex, _ => new List<Record>());
-                                            var recordsToAdd = partitionData.Records?.Records ?? Enumerable.Empty<Record>();
+                                            var recordsToAdd = (partitionData.Records?.Records ?? Enumerable.Empty<Record>()).ToList();
                                             long baseOffset = 0;
 
                                             if (recordsToAdd.Any())
@@ -594,14 +643,27 @@ namespace Kafka.TestFramework
             _testServer.On<OffsetCommitRequest, OffsetCommitResponse>(request =>
             {
                 var groupId = request.GroupId.Value ?? "";
-                foreach (var topic in request.TopicsCollection)
+                var requestGenerationId = request.GenerationIdOrMemberEpoch.Value;
+
+                // Reject stale commits: the generation in the request must match the current
+                // session's generation. After ClearGroup the session is removed (or restarted
+                // at a higher generation), so commits from a consumer that joined before the
+                // clear carry a stale generationId and must not poison the committed offsets.
+                var isValidCommit = _groupSessions.TryGetValue(groupId, out var currentSession)
+                    && currentSession.GenerationId == requestGenerationId;
+
+                if (isValidCommit)
                 {
-                    var topicName = topic.Name.Value ?? "";
-                    foreach (var partition in topic.PartitionsCollection)
-                        _committedOffsets[(groupId, topicName, partition.PartitionIndex.Value)] =
-                            partition.CommittedOffset.Value;
+                    foreach (var topic in request.TopicsCollection)
+                    {
+                        var topicName = topic.Name.Value ?? "";
+                        foreach (var partition in topic.PartitionsCollection)
+                            _committedOffsets[(groupId, topicName, partition.PartitionIndex.Value)] =
+                                partition.CommittedOffset.Value;
+                    }
                 }
 
+                var errorCode = isValidCommit ? (short)0 : (short)22; // 22 = ILLEGAL_GENERATION
                 return request.Respond()
                     .WithTopicsCollection(request.TopicsCollection.Select(topic =>
                         new Func<OffsetCommitResponse.OffsetCommitResponseTopic, OffsetCommitResponse.OffsetCommitResponseTopic>(
@@ -612,7 +674,7 @@ namespace Kafka.TestFramework
                                         OffsetCommitResponse.OffsetCommitResponseTopic.OffsetCommitResponsePartition>(
                                         responsePartition => responsePartition
                                             .WithPartitionIndex(partition.PartitionIndex)
-                                            .WithErrorCode(0)))
+                                            .WithErrorCode(errorCode)))
                                 .ToArray()))
                     ).ToArray());
             });
