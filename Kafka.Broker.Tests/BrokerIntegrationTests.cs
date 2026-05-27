@@ -350,11 +350,10 @@ public class BrokerIntegrationTests
 
     [Test]
     [Timeout(60000)]
-    public async Task TwoConsumersInGroup_PartitionsDistributed(CancellationToken cancellationToken)
+    public async Task TwoConsumersInGroup_BothReceiveAllMessages(CancellationToken cancellationToken)
     {
-        // Use a 2-partition topic so each consumer can own one partition.
-        // Both consumers subscribe before any consume loop runs, so both JoinGroup
-        // requests land within the 300ms settling window and are assigned together.
+        // Without leader/rebalancing each consumer in the group is assigned all
+        // partitions independently, so both consumers receive all produced messages.
         await using var broker = await BrokerFixture.CreateAndStartAsync("rebalance-topic", partitions: 2);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromSeconds(45));
@@ -365,12 +364,9 @@ public class BrokerIntegrationTests
         using var consumer1 = CreateConsumer(broker.BootstrapServers, "group-rebalance", AutoOffsetReset.Earliest);
         using var consumer2 = CreateConsumer(broker.BootstrapServers, "group-rebalance", AutoOffsetReset.Earliest);
 
-        // Subscribe both consumers synchronously so both JoinGroup requests go to the broker
-        // within the 300ms rebalance window, ensuring they are assigned as a group.
         consumer1.Subscribe("rebalance-topic");
         consumer2.Subscribe("rebalance-topic");
 
-        // Both consumers run in parallel
         var task1 = Task.Run(() =>
         {
             try
@@ -402,26 +398,26 @@ public class BrokerIntegrationTests
         // Give consumers time to complete JoinGroup/SyncGroup/OffsetFetch
         await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
 
-        // Now produce messages — consumers are already positioned
         using var producer = CreateProducer(broker.BootstrapServers);
         await producer.ProduceAsync("rebalance-topic", new Message<string, string> { Key = "key0", Value = "msg-p0" }, cts.Token);
         await producer.ProduceAsync("rebalance-topic", new Message<string, string> { Key = "key1", Value = "msg-p1" }, cts.Token);
         producer.Flush(cts.Token);
 
-        // Wait until both consumers together have received all messages
+        // Wait until each consumer has received both messages
         using var waitCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         while (!waitCts.IsCancellationRequested)
         {
-            if (receivedByC1.Count + receivedByC2.Count >= 2) break;
+            if (receivedByC1.Count >= 2 && receivedByC2.Count >= 2) break;
             await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
 
         cts.Cancel();
         await Task.WhenAll(task1, task2).ConfigureAwait(false);
 
-        var allReceived = receivedByC1.Concat(receivedByC2).ToList();
-        allReceived.Should().BeEquivalentTo(new[] { "msg-p0", "msg-p1" },
-            "both consumers together should receive all messages from both partitions");
+        receivedByC1.Should().Contain("msg-p0").And.Contain("msg-p1",
+            "each consumer gets all partitions assigned and sees all messages");
+        receivedByC2.Should().Contain("msg-p0").And.Contain("msg-p1",
+            "each consumer gets all partitions assigned and sees all messages");
     }
 
     [Test]
@@ -2171,10 +2167,9 @@ public class BrokerIntegrationTests
     // ── Multiple consumers / multiple producers tests ────────────────────────
 
     [Test]
-    public async Task MultipleConsumers_SameGroup_ReceiveAllMessages_WithoutDuplicates()
+    public async Task MultipleConsumers_SameGroup_BothReceiveAllMessages()
     {
-        // Two consumers in the same group share the partition (or both subscribe — in a
-        // single-partition topic only one will own it, but they together must see all msgs).
+        // Broadcast semantics: every consumer in the same group receives ALL messages.
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await using var broker = await BrokerFixture.CreateAndStartAsync("mc-topic", 1, "mc-group");
 
@@ -2189,17 +2184,26 @@ public class BrokerIntegrationTests
         c1.Subscribe("mc-topic");
         c2.Subscribe("mc-topic");
 
-        var received = new ConcurrentBag<string>();
+        var receivedByC1 = new List<string>();
+        var receivedByC2 = new List<string>();
         using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        while (!drainCts.IsCancellationRequested && received.Count < messages.Length)
+        while (!drainCts.IsCancellationRequested &&
+               (receivedByC1.Count < messages.Length || receivedByC2.Count < messages.Length))
         {
-            var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
-            if (r1?.Message?.Value != null) received.Add(r1.Message.Value);
-            var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
-            if (r2?.Message?.Value != null) received.Add(r2.Message.Value);
+            if (receivedByC1.Count < messages.Length)
+            {
+                var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
+                if (r1?.Message?.Value != null) receivedByC1.Add(r1.Message.Value);
+            }
+            if (receivedByC2.Count < messages.Length)
+            {
+                var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
+                if (r2?.Message?.Value != null) receivedByC2.Add(r2.Message.Value);
+            }
         }
 
-        received.Should().BeEquivalentTo(messages, "all messages must be consumed exactly once across the group");
+        receivedByC1.Should().BeEquivalentTo(messages, "each consumer gets all messages (broadcast semantics)");
+        receivedByC2.Should().BeEquivalentTo(messages, "each consumer gets all messages (broadcast semantics)");
     }
 
     [Test]
@@ -2347,18 +2351,27 @@ public class BrokerIntegrationTests
         c1.Subscribe("mc-clear-topic");
         c2.Subscribe("mc-clear-topic");
 
-        var received = new ConcurrentBag<string>();
+        var r1Vals = new List<string>();
+        var r2Vals = new List<string>();
         using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        while (!readCts.IsCancellationRequested && received.Count < 2)
+        while (!readCts.IsCancellationRequested && (r1Vals.Count < 2 || r2Vals.Count < 2))
         {
-            var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
-            if (r1?.Message?.Value != null) received.Add(r1.Message.Value);
-            var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
-            if (r2?.Message?.Value != null) received.Add(r2.Message.Value);
+            if (r1Vals.Count < 2)
+            {
+                var r1 = c1.Consume(TimeSpan.FromMilliseconds(200));
+                if (r1?.Message?.Value != null) r1Vals.Add(r1.Message.Value);
+            }
+            if (r2Vals.Count < 2)
+            {
+                var r2 = c2.Consume(TimeSpan.FromMilliseconds(200));
+                if (r2?.Message?.Value != null) r2Vals.Add(r2.Message.Value);
+            }
         }
 
-        received.Should().BeEquivalentTo(new[] { "new-1", "new-2" },
-            "after clear, Earliest consumers must start from offset 0 and receive all new messages");
+        r1Vals.Should().BeEquivalentTo(new[] { "new-1", "new-2" },
+            "after clear, c1 must start from offset 0 and receive all new messages (broadcast)");
+        r2Vals.Should().BeEquivalentTo(new[] { "new-1", "new-2" },
+            "after clear, c2 must start from offset 0 and receive all new messages (broadcast)");
     }
 
     [Test]
@@ -2646,12 +2659,12 @@ public class BrokerIntegrationTests
 
     [Test]
     [Timeout(30000)]
-    public async Task ClearGroupDuringSettleWindow_CommitSucceeds_NextConsumerStartsFromCommittedOffset(CancellationToken cancellationToken)
+    public async Task AfterClearGroup_CommitWithNewGeneration_NextConsumerStartsFromCommittedOffset(CancellationToken cancellationToken)
     {
-        // Bug: old SettleJoinGroup (fired before ClearGroup) finds the NEW session after ClearGroup
-        // and increments its GenerationId. The new SettleJoinGroup increments it again.
-        // Net result: session.GenerationId = consumer's generationId + 1 → OffsetCommit → ILLEGAL_GENERATION.
-        // C2 then starts from Earliest (0) and re-reads msg-0 instead of the expected msg-1.
+        // Invariant: after ClearGroup a consumer joins with a new generation, commits, and
+        // the commit persists so the next consumer starts from the committed offset.
+        // (ClearGroup first clears all committed offsets, so the rejoining consumer reads from
+        // Earliest = offset 0, commits offset 1, then C2 sees committed offset 1 → msg-1.)
         await using var broker = await BrokerFixture.CreateAndStartAsync("commit-settle-topic");
 
         using var producer = CreateProducer(broker.BootstrapServers);
@@ -2661,72 +2674,207 @@ public class BrokerIntegrationTests
             new Message<string, string> { Key = "k1", Value = "msg-1" }, cancellationToken);
         producer.Flush(cancellationToken);
 
-        // C1: manual-commit consumer
-        var c1Config = new ConsumerConfig
-        {
-            BootstrapServers = broker.BootstrapServers,
-            GroupId = "commit-settle-group",
-            AutoOffsetReset = AutoOffsetReset.Earliest,
-            SecurityProtocol = SecurityProtocol.Plaintext,
-            EnableAutoCommit = false,
-            SessionTimeoutMs = 6000,
-            MaxPollIntervalMs = 30000,
-            SocketTimeoutMs = 10000,
-            FetchWaitMaxMs = 500,
-        };
-        using var c1 = new ConsumerBuilder<string, string>(c1Config).Build();
-        c1.Subscribe("commit-settle-topic");
-
-        // Kick JoinGroup into the broker, then ClearGroup inside the 300 ms settle window.
-        try { c1.Consume(TimeSpan.FromMilliseconds(20)); } catch (ConsumeException) { }
-        await Task.Delay(80, cancellationToken);
+        // ClearGroup before any consumer joins → gen=1, offsets cleared (were already empty).
         broker.ClearGroup("commit-settle-group");
 
-        // C1 recovers, reads msg-0, commits.
+        // C1 joins fresh with the current gen (gen=1 from CompareExchange? No — ClearGroup
+        // only increments; gen was 0 and is now 1. JoinGroup's CompareExchange(ref gen,1,0)
+        // would then try to set 1 if 0, but it's already 1 → no-op. Gen stays 1.)
+        using var c1 = CreateConsumer(broker.BootstrapServers, "commit-settle-group", AutoOffsetReset.Earliest);
+        c1.Subscribe("commit-settle-topic");
+
         ConsumeResult<string, string>? c1Result = null;
-        using var cts1 = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        using var cts1 = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         try
         {
             while (!cts1.IsCancellationRequested && c1Result == null)
             {
-                try
-                {
-                    var r = c1.Consume(TimeSpan.FromMilliseconds(200));
-                    if (r?.Message?.Value != null) c1Result = r;
-                }
-                catch (ConsumeException) { }
+                var r = c1.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) c1Result = r;
             }
         }
         catch (OperationCanceledException) { }
 
-        c1Result.Should().NotBeNull("C1 must receive msg-0 after recovering from ClearGroup");
+        c1Result.Should().NotBeNull("C1 must receive msg-0");
         c1Result!.Message.Value.Should().Be("msg-0");
         c1.Commit(c1Result);
         c1.Close();
 
-        // C2 joins the same group — must start from the committed offset (1), not Earliest (0).
+        // C2 joins — must see the committed offset (1) and start from msg-1.
         using var c2 = CreateConsumer(broker.BootstrapServers, "commit-settle-group", AutoOffsetReset.Earliest);
         c2.Subscribe("commit-settle-topic");
 
         string? c2Message = null;
-        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         try
         {
             while (!cts2.IsCancellationRequested && c2Message == null)
             {
-                try
-                {
-                    var r = c2.Consume(TimeSpan.FromMilliseconds(200));
-                    if (r?.Message?.Value != null) c2Message = r.Message.Value;
-                }
-                catch (ConsumeException) { }
+                var r = c2.Consume(TimeSpan.FromMilliseconds(200));
+                if (r?.Message?.Value != null) c2Message = r.Message.Value;
             }
         }
         catch (OperationCanceledException) { }
 
         c2Message.Should().Be("msg-1",
-            "C2 must start from committed offset (after msg-0), not re-read msg-0 from Earliest — " +
-            "OffsetCommit must not return ILLEGAL_GENERATION due to stale SettleJoinGroup");
+            "C2 must start from committed offset 1 (left by C1), not re-read msg-0 from Earliest");
         c2.Close();
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task FetchResponse_ErrorPartition_DoesNotBlockValidPartition(CancellationToken cancellationToken)
+    {
+        // Bug: when a FetchResponse contains an error partition (ErrorCode != 0), the Records
+        // field is left unset (null), which serialises as -1 (MessageSetSize). librdkafka logs
+        // "invalid MessageSetSize -1" and may fail to parse the WHOLE FetchResponse, meaning
+        // messages from the VALID sibling partition are never delivered.
+        // Fix: for error partitions, send an empty record batch (Magic=2) instead of null.
+        await using var broker = await BrokerFixture.CreateAndStartAsync(
+            ("error-valid-topic", 2));   // 2 partitions: 0 = error, 1 = valid message
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+
+        // Write a message specifically to partition 1
+        await producer.ProduceAsync("error-valid-topic",
+            new Message<string, string> { Key = "k1", Value = "msg-p1" },
+            cancellationToken);
+        producer.Flush(cancellationToken);
+
+        // Inject error on partition 0 AFTER produce so the produce itself succeeds
+        broker.SetPartitionError("error-valid-topic", 0, 5); // LEADER_NOT_AVAILABLE
+
+        // Consumer subscribes — librdkafka assigns both partitions and batches them in one FetchRequest.
+        // FetchResponse: partition 0 has ErrorCode=5 + null records; partition 1 has the valid message.
+        // If null records cause a parse failure the consumer will never see the partition 1 message.
+        var config = new ConsumerConfig
+        {
+            BootstrapServers = broker.BootstrapServers,
+            GroupId = "error-valid-group",
+            AutoOffsetReset = AutoOffsetReset.Earliest,
+            SecurityProtocol = SecurityProtocol.Plaintext,
+            SocketTimeoutMs = 10000,
+        };
+        using var consumer = new ConsumerBuilder<string, string>(config)
+            .SetErrorHandler((_, _) => { })
+            .Build();
+        consumer.Subscribe("error-valid-topic");
+
+        string? received = null;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+        try
+        {
+            while (!cts.IsCancellationRequested && received == null)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(300));
+                    if (r?.Message?.Value != null) received = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().Be("msg-p1",
+            "error on partition 0 must not prevent delivery of the valid message on partition 1 " +
+            "— null Records in FetchResponse causes librdkafka parse failure of the whole response");
+        consumer.Close();
+    }
+
+    [Test]
+    [Timeout(15000)]
+    public async Task FetchRequest_MessageProducedDuringLongPoll_ReceivedWithoutFullMaxWaitDelay(CancellationToken cancellationToken)
+    {
+        // Bug: FetchRequest enters Task.Delay(MaxWaitMs=500ms) when no records exist.
+        // A message produced during that window is only delivered AFTER the full delay.
+        // Fix: per-partition SemaphoreSlim wakes waiting fetches immediately on produce.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("wakeup-topic");
+
+        using var consumer = CreateConsumer(broker.BootstrapServers, "wakeup-group", AutoOffsetReset.Earliest);
+        consumer.Subscribe("wakeup-topic");
+
+        // Let consumer settle and enter its first FetchRequest long-poll
+        await Task.Delay(1200, cancellationToken);
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await producer.ProduceAsync("wakeup-topic",
+            new Message<string, string> { Key = "k", Value = "wake" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        string? received = null;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try
+        {
+            while (!cts.IsCancellationRequested && received == null)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(100));
+                    if (r?.Message?.Value != null) received = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+        sw.Stop();
+
+        received.Should().Be("wake", "consumer must receive the message");
+        sw.ElapsedMilliseconds.Should().BeLessThan(200,
+            "after fix: FetchRequest long-poll wakes immediately on produce via SemaphoreSlim, " +
+            "not after the full 500 ms MaxWaitMs window");
+        consumer.Close();
+    }
+
+    [Test]
+    [Timeout(30000)]
+    public async Task ClearGroup_BetweenJoinAndSync_NewConsumerStillReceivesMessage(CancellationToken cancellationToken)
+    {
+        // Scenario: ClearGroup fires AFTER JoinGroupResponse is sent to the leader
+        // but BEFORE the leader's SyncGroup is received. The leader's SyncGroup
+        // creates a new SyncSession (the cleared one is gone). Assignments complete.
+        // BUT: the very next Heartbeat returns 27 (group session was cleared),
+        // forcing the leader to rebalance immediately — adding ~heartbeat.interval.ms latency.
+        // The consumer must eventually receive the message despite this extra rebalance.
+        await using var broker = await BrokerFixture.CreateAndStartAsync("join-sync-clear-topic");
+
+        using var producer = CreateProducer(broker.BootstrapServers);
+        await producer.ProduceAsync("join-sync-clear-topic",
+            new Message<string, string> { Key = "k", Value = "msg" }, cancellationToken);
+        producer.Flush(cancellationToken);
+
+        using var consumer = CreateConsumer(broker.BootstrapServers, "join-sync-clear-group", AutoOffsetReset.Earliest);
+        consumer.Subscribe("join-sync-clear-topic");
+
+        // Give the consumer time to start JoinGroup → SettleJoinGroup (300 ms) → receive JoinGroupResponse,
+        // then call ClearGroup right as it would be sending SyncGroup.
+        // We can't time it perfectly, so we just clear after ~400 ms — enough to land after settle
+        // but potentially before the consumer's SyncGroup completes.
+        await Task.Delay(400, cancellationToken);
+        broker.ClearGroup("join-sync-clear-group");
+
+        // Consumer detects REBALANCE on next Heartbeat (≤ heartbeat.interval.ms = 3 s),
+        // rejoins, gets a fresh gen, and eventually consumes the message.
+        string? received = null;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try
+        {
+            while (!cts.IsCancellationRequested && received == null)
+            {
+                try
+                {
+                    var r = consumer.Consume(TimeSpan.FromMilliseconds(200));
+                    if (r?.Message?.Value != null) received = r.Message.Value;
+                }
+                catch (ConsumeException) { }
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        received.Should().Be("msg",
+            "consumer must receive the message even after ClearGroup fires between JoinGroupResponse " +
+            "and SyncGroup — the extra rebalance adds latency but must not permanently block delivery");
+        consumer.Close();
     }
 }

@@ -6,7 +6,7 @@
     <WarningsAsErrors>CS8600;CS8601;CS8603;CS8614;CS8618;CS8625</WarningsAsErrors>
 
     <PackageId>Kafka.TestBroker</PackageId>
-    <PackageVersion>1.5.0</PackageVersion>
+    <PackageVersion>1.6.0</PackageVersion>
     <Description>An in-process fake Kafka broker for integration tests and local development. No Docker, no Zookeeper — just add the package and go.</Description>
     <PackageTags>kafka test broker testing integration fake mock</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
